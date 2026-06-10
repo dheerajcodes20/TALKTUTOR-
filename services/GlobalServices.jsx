@@ -44,15 +44,12 @@ export const AIModel = async (topic, coachingOption, msg) => {
 
 
 export const CovertTextToSpeech = async (text, expertName) => {
-    console.log("[TTS] Called with:", text, expertName); // Debug log
     if (!text || !expertName) {
         throw new Error("Text or expertName missing for TTS");
     }
-    // Map expertName to correct Amazon Polly voiceId
-    let voiceId = "Joanna"; // Default
-    if (expertName === "Joey") voiceId = "Joey";
-    else if (expertName === "Salli") voiceId = "Salli";
-    else if (expertName === "Joanna") voiceId = "Joanna";
+
+    const expert = CoachingExpert.find((item) => item.name === expertName);
+    const voiceId = expert?.voiceId || "Joanna";
 
     const response = await fetch('/api/tts', {
         method: 'POST',
@@ -64,6 +61,8 @@ export const CovertTextToSpeech = async (text, expertName) => {
         throw new Error('TTS API error: ' + (err.error || response.statusText));
     }
     const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    return url;
+    if (!blob.size) {
+        throw new Error('TTS API returned empty audio');
+    }
+    return URL.createObjectURL(blob);
 };

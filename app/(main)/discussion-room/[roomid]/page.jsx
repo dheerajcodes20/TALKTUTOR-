@@ -62,7 +62,6 @@ function DiscussionRoom() {
   const [isRecording, setIsRecording] = useState(false);
   const [aiResponse, setAiResponse] = useState('');
   const [conversation, setConversation] = useState([]);
-  const [pendingUserMsg, setPendingUserMsg] = useState(null);
   const [loadingAI, setLoadingAI] = useState(false);
   const [isDetectingSilence, setIsDetectingSilence] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -72,6 +71,7 @@ function DiscussionRoom() {
   // Remove pendingAI state since we'll handle AI responses directly
   
   const recorder = useRef(null);
+  const mediaStreamRef = useRef(null);
   const silenceTimeoutRef = useRef(null);
   const UpdateConversation = useMutation(api.DiscussionRoom.UpdateConversation);
 
@@ -83,22 +83,66 @@ function DiscussionRoom() {
 
   const Expert = CoachingExpert.find((item) => item.name === DiscussionRoomData?.expertName);
   console.log("Expert:", Expert);
-  // Speech synthesis utility using Amazon Polly
-  const speakText = async (text, expertName) => {
+  const playAIResponse = async (text) => {
+    if (!text || !Expert?.name) return;
     try {
-      const audioUrl = await CovertTextToSpeech(text, expertName);
-      if (audioPlayer.current) {
-        audioPlayer.current.src = audioUrl;
-        await audioPlayer.current.play();
-        return new Promise((resolve) => {
-          audioPlayer.current.onended = () => {
-            URL.revokeObjectURL(audioUrl); // Clean up the blob URL
-            resolve();
-          };
-        });
-      }
+      const ttsUrl = await CovertTextToSpeech(text, Expert.name);
+      if (!ttsUrl || !audioPlayer.current) return;
+
+      audioPlayer.current.src = ttsUrl;
+      await audioPlayer.current.play();
+      audioPlayer.current.onended = () => URL.revokeObjectURL(ttsUrl);
     } catch (err) {
       console.error('Error in text-to-speech:', err);
+    }
+  };
+
+  const cleanTranscript = (text) =>
+    (text || '')
+      .replace(/["'*`#]/g, '')
+      .replace(/\b(undefined|null|NaN)\b/gi, '')
+      .replace(/undefined|null|NaN/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const stopMic = () => {
+    setEnableMic(false);
+    setIsRecording(false);
+    setIsDetectingSilence(false);
+    if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+    }
+  };
+
+  const processVoiceInput = async (blob) => {
+    try {
+      setLoadingAI(true);
+      const res = await fetch('/api/transcribe', {
+        method: 'POST',
+        headers: { 'Content-Type': blob.type || 'audio/webm' },
+        body: blob,
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        setTranscript(data.error || 'Transcription failed.');
+        setLoadingAI(false);
+        return;
+      }
+
+      const cleanedTranscript = cleanTranscript(data.transcript);
+      setTranscript(cleanedTranscript || 'No speech detected.');
+
+      if (cleanedTranscript) {
+        await handleSendMessage(cleanedTranscript);
+      } else {
+        setLoadingAI(false);
+      }
+    } catch (err) {
+      setTranscript('Transcription error: ' + (err?.message || 'Unknown error'));
+      setLoadingAI(false);
     }
   };
 
@@ -124,61 +168,56 @@ function DiscussionRoom() {
     };
   }, []);
 
-  // Modified useEffect for handling AI responses
-  useEffect(() => {
-    if (pendingUserMsg) {
-      setConversation(prev => [...prev, pendingUserMsg]);
-      setPendingUserMsg(null);
-    }
-  }, [pendingUserMsg]);
-
   const connectToServer = async () => {
+    if (typeof window === 'undefined' || typeof navigator === 'undefined') return;
+
     setEnableMic(true);
     setTranscript('');
     setIsRecording(true);
     setIsDetectingSilence(true);
 
-    if (typeof window !== "undefined" && typeof navigator !== "undefined") {
-      navigator.mediaDevices.getUserMedia({ audio: true })
-        .then((stream) => {
-          recorder.current = new RecordRTC(stream, {
-            type: 'audio',
-            mimeType: 'audio/webm;codecs=pcm',
-            recorderType: RecordRTC.StereoAudioRecorder,
-            desiredSampRate: 16000,
-            numberOfAudioChannels: 1,
-            bufferSize: 4096,
-            audioBitsPerSecond: 128000,
-            timeSlice: 500,
-            ondataavailable: () => {
-              // Reset silence timer on every audio chunk
-              if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
-              silenceTimeoutRef.current = setTimeout(() => {
-                setIsDetectingSilence(false);
-                handleDisconnect();
-              }, 5000); // 5 seconds of silence triggers disconnect
-            }
-          });
-          recorder.current.startRecording();
-          // Start silence timer in case ondataavailable is not called
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+
+      recorder.current = new RecordRTC(stream, {
+        type: 'audio',
+        mimeType: 'audio/webm',
+        numberOfAudioChannels: 1,
+        desiredSampRate: 16000,
+        timeSlice: 500,
+        ondataavailable: () => {
+          if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
           silenceTimeoutRef.current = setTimeout(() => {
             setIsDetectingSilence(false);
-            handleDisconnect();
-          }, 10000); // fallback: 10s max
-        })
-        .catch((err) => console.error(err));
+            disconnect();
+          }, 5000);
+        },
+      });
+
+      recorder.current.startRecording();
+      silenceTimeoutRef.current = setTimeout(() => {
+        setIsDetectingSilence(false);
+        disconnect();
+      }, 30000);
+    } catch (err) {
+      console.error(err);
+      setTranscript('Microphone access denied or unavailable. Please allow mic access.');
+      stopMic();
     }
-  }
+  };
 
   const handleSendMessage = async (msg) => {
     try {
       setLoadingAI(true);
-      // Add user message to conversation immediately
-      const newUserMessage = { content: msg, role: 'user' };
-      const updatedConversation = [...conversation, newUserMessage];
-      setConversation(updatedConversation);
-      
-      // Save conversation with user message
+      const newUserMessage = { content: cleanAndJoin(msg), role: 'user' };
+
+      let updatedConversation = [];
+      setConversation((prev) => {
+        updatedConversation = [...prev, newUserMessage];
+        return updatedConversation;
+      });
+
       if (roomid) {
         await UpdateConversation({
           id: roomid,
@@ -186,7 +225,6 @@ function DiscussionRoom() {
         });
       }
 
-      // Get AI response
       const response = await AIModel(
         DiscussionRoomData?.topic,
         DiscussionRoomData?.coachingOption,
@@ -197,12 +235,13 @@ function DiscussionRoom() {
         let aiMsg = response?.choices?.[0]?.message?.content || '';
         aiMsg = cleanAIReply(aiMsg);
         const newAIMessage = { content: aiMsg, role: 'assistant' };
-        
-        // Update conversation with AI response
-        const finalConversation = [...updatedConversation, newAIMessage];
-        setConversation(finalConversation);
-        
-        // Save the final conversation with both messages
+
+        let finalConversation = [];
+        setConversation((prev) => {
+          finalConversation = [...prev, newAIMessage];
+          return finalConversation;
+        });
+
         if (roomid) {
           await UpdateConversation({
             id: roomid,
@@ -210,97 +249,12 @@ function DiscussionRoom() {
           });
         }
 
-        // Convert AI response to speech
-        if (aiMsg && Expert?.name) {
-          const ttsUrl = await CovertTextToSpeech(aiMsg, Expert.name);
-          console.log('[TTS] Playing audio from:', ttsUrl);
-          if (ttsUrl && audioPlayer.current) {
-            audioPlayer.current.src = ttsUrl;
-            audioPlayer.current.play();
-          }
-        }
+        await playAIResponse(aiMsg);
       }
     } catch (error) {
       console.error("Error in handleSendMessage:", error);
     } finally {
       setLoadingAI(false);
-    }
-  };
-
-  // Modified useEffect for handling pendingUserMsg
-  useEffect(() => {
-    if (pendingUserMsg) {
-      handleSendMessage(pendingUserMsg.content);
-      setPendingUserMsg(null);
-    }
-  }, [pendingUserMsg]);
-
-  const handleDisconnect = async (e) => {
-    if (e) e.preventDefault();
-    setEnableMic(false);
-    setIsRecording(false);
-    setIsDetectingSilence(false);
-    if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
-
-    if (recorder.current) {
-      recorder.current.stopRecording(async () => {
-        const blob = recorder.current.getBlob();
-        recorder.current = null;
-
-        try {
-          const res = await fetch("/api/transcribe", {
-            method: "POST",
-            body: blob,
-          });
-          const data = await res.json();
-          const cleanedTranscript = (data.transcript || '')
-            .replace(/["'*`#]/g, '') // Remove unwanted symbols
-            .replace(/\b(undefined|null|NaN)\b/gi, '')
-            .replace(/undefined|null|NaN/gi, '')
-            .replace(/\s+/g, ' ')
-            .trim();
-          setTranscript(cleanedTranscript || data.error || "Transcription failed.");
-
-          if (cleanedTranscript && cleanedTranscript !== '') {
-            setLoadingAI(true);
-            const newUserMessage = { content: cleanAndJoin(cleanedTranscript), role: 'user' };
-            const updatedConversation = [...conversation, newUserMessage];
-            setConversation(updatedConversation);
-            if (roomid) {
-              await UpdateConversation({ id: roomid, conversation: updatedConversation });
-            }
-            const response = await AIModel(
-              DiscussionRoomData?.topic,
-              DiscussionRoomData?.coachingOption,
-              cleanedTranscript
-            );
-            if (!response?.error) {
-              let aiMsg = response?.choices?.[0]?.message?.content || '';
-              aiMsg = cleanAIReply(aiMsg);
-              const newAIMessage = { content: aiMsg, role: 'assistant' };
-              const finalConversation = [...updatedConversation, newAIMessage];
-              setConversation(finalConversation);
-              if (roomid) {
-                await UpdateConversation({ id: roomid, conversation: finalConversation });
-              }
-              // Play voice immediately after text
-              setTimeout(async () => {
-                if (aiMsg && Expert?.name) {
-                  const ttsUrl = await CovertTextToSpeech(aiMsg, Expert.name);
-                  if (ttsUrl && audioPlayer.current) {
-                    audioPlayer.current.src = ttsUrl;
-                    audioPlayer.current.play();
-                  }
-                }
-              }, 0);
-            }
-            setLoadingAI(false); // Only set false after all is done
-          }
-        } catch (err) {
-          setTranscript('Transcription error: ' + (err?.message || "Unknown error"));
-          setLoadingAI(false);
-        }
-      });
     }
   };
 
@@ -331,55 +285,23 @@ function DiscussionRoom() {
     }
   }, [DiscussionRoomData]);
 
-  // Handle adding pending messages to conversation
-  useEffect(() => {
-    if (pendingUserMsg) {
-      setConversation(prev => [...prev, pendingUserMsg]);
-      setPendingUserMsg(null);
-    }
-  }, [pendingUserMsg]);
-
   const disconnect = async (e) => {
     if (e) e.preventDefault();
-    setEnableMic(false);
-    setIsRecording(false);
-    setIsDetectingSilence(false);
-    if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
+    stopMic();
 
-    if (recorder.current) {
-      recorder.current.stopRecording(async () => {
-        const blob = recorder.current.getBlob();
-        recorder.current = null;
+    if (!recorder.current) return;
 
-        try {
-          const res = await fetch("/api/transcribe", {
-            method: "POST",
-            body: blob,
-          });
-          const data = await res.json();
-          
-          // Clean transcript thoroughly
-          const cleanedTranscript = (data.transcript || '')
-            .replace(/["'*`#]/g, '') // Remove unwanted symbols
-            .replace(/\b(undefined|null|NaN)\b/gi, '')
-            .replace(/undefined|null|NaN/gi, '')
-            .replace(/\s+/g, ' ')
-            .trim();
-          setTranscript(cleanedTranscript || data.error || "Transcription failed.");
+    recorder.current.stopRecording(async () => {
+      const blob = recorder.current.getBlob();
+      recorder.current = null;
 
-          if (cleanedTranscript && cleanedTranscript !== '') {
-            // Set pendingUserMsg with the transcript
-            setPendingUserMsg({ 
-              role: 'user', 
-              content: cleanAndJoin(cleanedTranscript)
-            });
-          }
-        } catch (err) {
-          setTranscript('Transcription error: ' + (err?.message || "Unknown error"));
-          setLoadingAI(false);
-        }
-      });
-    }
+      if (!blob || blob.size === 0) {
+        setTranscript('No audio recorded. Please check your microphone and try again.');
+        return;
+      }
+
+      await processVoiceInput(blob);
+    });
   };
 
   // Feedback handler
@@ -451,9 +373,12 @@ function DiscussionRoom() {
                     )}
                   </div>
                   {!enableMic ? (
-                    <Button onClick={connectToServer} disabled={isRecording || loadingAI || pendingUserMsg} className="w-full sm:w-auto">Connect</Button>
+                    <Button onClick={connectToServer} disabled={isRecording || loadingAI} className="w-full sm:w-auto">Connect</Button>
                   ) : (
                     <Button variant="destructive" onClick={disconnect} disabled={!isRecording} className="w-full sm:w-auto">Disconnect</Button>
+                  )}
+                  {transcript && (
+                    <p className="mt-2 text-xs text-gray-500 text-center max-w-md">{transcript}</p>
                   )}
                 </div>
             </div>
@@ -467,7 +392,7 @@ function DiscussionRoom() {
                 userAvatar={'/mypic.jpeg'}
                 aiAvatar={Expert?.avatar || '/ai-avatar.png'}
                 topic={DiscussionRoomData?.topic}
-                conversationEnded={!enableMic && !isRecording && !loadingAI && !pendingUserMsg}
+                conversationEnded={!enableMic && !isRecording && !loadingAI}
               />
               {/* Feedback section for mobile: show below chatbox */}
               <div className="block lg:hidden w-full mt-4">
